@@ -6,6 +6,8 @@ A decision-support tool for warehouse managers to:
 2. Predict future constraints
 3. Simulate operational changes
 4. Get actionable recommendations
+5. Calculate cost savings
+6. Export reports
 """
 
 import streamlit as st
@@ -13,8 +15,9 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
+from io import BytesIO
+import base64
 
 # Import our modules
 from src.data_generator import generate_dataset, STAGE_CONFIG
@@ -58,6 +61,18 @@ st.markdown("""
         padding: 15px;
         margin: 10px 0;
     }
+    .cost-savings {
+        background-color: #e8f5e9;
+        border-left: 5px solid #4caf50;
+        padding: 15px;
+        border-radius: 5px;
+    }
+    .upload-section {
+        background-color: #fff3e0;
+        border-radius: 10px;
+        padding: 15px;
+        margin: 10px 0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -81,54 +96,282 @@ def train_predictor(_data: pd.DataFrame):
     return predictor, metrics
 
 
+def validate_uploaded_csv(df: pd.DataFrame) -> tuple[bool, str]:
+    """Validate uploaded CSV has required columns."""
+    required_cols = ["order_id", "stage", "start_time", "end_time"]
+    missing = [col for col in required_cols if col not in df.columns]
+
+    if missing:
+        return False, f"Missing required columns: {', '.join(missing)}"
+
+    # Check stage values
+    valid_stages = {"receiving", "picking", "packing", "sorting", "shipping"}
+    unique_stages = set(df["stage"].str.lower().unique())
+    invalid_stages = unique_stages - valid_stages
+
+    if invalid_stages:
+        return False, f"Invalid stage values: {invalid_stages}. Must be: {valid_stages}"
+
+    return True, "Valid"
+
+
+def process_uploaded_csv(df: pd.DataFrame) -> pd.DataFrame:
+    """Process uploaded CSV to match expected format."""
+    df = df.copy()
+    df["stage"] = df["stage"].str.lower()
+    df["start_time"] = pd.to_datetime(df["start_time"])
+    df["end_time"] = pd.to_datetime(df["end_time"])
+
+    # Calculate cycle time if not present
+    if "cycle_time_minutes" not in df.columns:
+        df["cycle_time_minutes"] = (df["end_time"] - df["start_time"]).dt.total_seconds() / 60
+
+    # Calculate queue time if not present (estimate as 0 for uploaded data)
+    if "queue_time_minutes" not in df.columns:
+        df["queue_time_minutes"] = 0
+
+    # Add defaults for missing optional columns
+    if "worker_id" not in df.columns:
+        df["worker_id"] = "UNKNOWN"
+    if "item_count" not in df.columns:
+        df["item_count"] = 1
+    if "priority" not in df.columns:
+        df["priority"] = "standard"
+
+    return df
+
+
+def generate_excel_report(df, analysis, metrics, utilization, recommendations, cost_config):
+    """Generate Excel report with multiple sheets."""
+    output = BytesIO()
+
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        # Summary sheet
+        summary_data = {
+            "Metric": [
+                "Report Generated",
+                "Total Orders Analyzed",
+                "Date Range",
+                "Current Bottleneck",
+                "Bottleneck Confidence",
+                "Primary Reason",
+                "Total Queue Time (min)",
+                "Estimated Delay Cost",
+                "Potential Additional Orders"
+            ],
+            "Value": [
+                datetime.now().strftime("%Y-%m-%d %H:%M"),
+                df["order_id"].nunique(),
+                f"{df['start_time'].min().date()} to {df['end_time'].max().date()}",
+                analysis.bottleneck_stage.upper(),
+                f"{analysis.confidence:.1%}",
+                analysis.primary_reason,
+                f"{cost_config['total_queue_minutes']:,.0f}",
+                f"${cost_config['total_delay_cost']:,.2f}",
+                cost_config['potential_additional_orders']
+            ]
+        }
+        pd.DataFrame(summary_data).to_excel(writer, sheet_name="Summary", index=False)
+
+        # Stage Metrics sheet
+        metrics.to_excel(writer, sheet_name="Stage Metrics", index=False)
+
+        # Utilization sheet
+        utilization.to_excel(writer, sheet_name="Utilization", index=False)
+
+        # Recommendations sheet
+        rec_data = []
+        for rec in recommendations:
+            rec_data.append({
+                "Rank": rec.rank,
+                "Action": rec.action,
+                "Expected Improvement": f"{rec.expected_improvement_pct:+.1f}%",
+                "Implementation Effort": rec.implementation_effort,
+                "Resolves Bottleneck": "Yes" if rec.scenario_result.bottleneck_resolved else "No",
+                "Reasoning": rec.reasoning,
+                "Implementation Notes": rec.scenario_result.implementation_notes
+            })
+        pd.DataFrame(rec_data).to_excel(writer, sheet_name="Recommendations", index=False)
+
+        # Cost Analysis sheet
+        cost_data = {
+            "Category": [
+                "Hourly Worker Wage",
+                "Cost per Delay Minute",
+                "Total Queue Time (minutes)",
+                "Total Delay Cost",
+                "Potential Additional Orders",
+                "Revenue per Order",
+                "Lost Revenue from Delays",
+                "Annual Projected Loss (if unchanged)"
+            ],
+            "Value": [
+                f"${cost_config['hourly_wage']:.2f}",
+                f"${cost_config['delay_cost_per_min']:.2f}",
+                f"{cost_config['total_queue_minutes']:,.0f}",
+                f"${cost_config['total_delay_cost']:,.2f}",
+                f"{cost_config['potential_additional_orders']:,}",
+                f"${cost_config['revenue_per_order']:.2f}",
+                f"${cost_config['lost_revenue']:,.2f}",
+                f"${cost_config['annual_loss']:,.2f}"
+            ]
+        }
+        pd.DataFrame(cost_data).to_excel(writer, sheet_name="Cost Analysis", index=False)
+
+    return output.getvalue()
+
+
+def generate_csv_report(df, analysis, metrics, recommendations, cost_config):
+    """Generate simple CSV summary report."""
+    report_lines = []
+    report_lines.append("WAREHOUSE FLOW OPTIMIZER - ANALYSIS REPORT")
+    report_lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    report_lines.append("")
+    report_lines.append("=== BOTTLENECK ANALYSIS ===")
+    report_lines.append(f"Current Bottleneck: {analysis.bottleneck_stage.upper()}")
+    report_lines.append(f"Confidence: {analysis.confidence:.1%}")
+    report_lines.append(f"Reason: {analysis.primary_reason}")
+    report_lines.append("")
+    report_lines.append("=== COST IMPACT ===")
+    report_lines.append(f"Total Delay Cost: ${cost_config['total_delay_cost']:,.2f}")
+    report_lines.append(f"Lost Revenue: ${cost_config['lost_revenue']:,.2f}")
+    report_lines.append(f"Annual Projected Loss: ${cost_config['annual_loss']:,.2f}")
+    report_lines.append("")
+    report_lines.append("=== TOP RECOMMENDATIONS ===")
+    for rec in recommendations[:3]:
+        report_lines.append(f"{rec.rank}. {rec.action} (Expected: {rec.expected_improvement_pct:+.1f}%)")
+
+    return "\n".join(report_lines)
+
+
 def main():
     st.title("📦 Warehouse Flow Optimizer")
     st.markdown("*Bottleneck Detection & Throughput Optimization*")
 
-    # Sidebar - Data Configuration
-    st.sidebar.header("📊 Data Configuration")
+    # Initialize session state
+    if "data_source" not in st.session_state:
+        st.session_state.data_source = "synthetic"
+    if "uploaded_df" not in st.session_state:
+        st.session_state.uploaded_df = None
 
-    with st.sidebar.expander("Generate Synthetic Data", expanded=True):
-        num_days = st.slider("Days of data", 7, 30, 14)
-        bottleneck_stage = st.selectbox(
-            "Simulate bottleneck at",
-            ["None", "picking", "packing", "sorting", "shipping"]
+    # Sidebar - Data Source Selection
+    st.sidebar.header("📊 Data Source")
+
+    data_source = st.sidebar.radio(
+        "Choose data source:",
+        ["Generate Synthetic Data", "Upload CSV File"],
+        index=0 if st.session_state.data_source == "synthetic" else 1
+    )
+
+    df = None
+    num_days = 14  # Default for calculations
+
+    if data_source == "Generate Synthetic Data":
+        st.session_state.data_source = "synthetic"
+
+        with st.sidebar.expander("Synthetic Data Settings", expanded=True):
+            num_days = st.slider("Days of data", 7, 30, 14)
+            bottleneck_stage = st.selectbox(
+                "Simulate bottleneck at",
+                ["None", "picking", "packing", "sorting", "shipping"]
+            )
+            severity = st.slider("Bottleneck severity", 1.0, 2.0, 1.4, 0.1)
+            seed = st.number_input("Random seed", value=42, step=1)
+
+        df = load_data(num_days, bottleneck_stage, severity, int(seed))
+
+    else:  # Upload CSV
+        st.session_state.data_source = "upload"
+
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("**Required CSV columns:**")
+        st.sidebar.code("order_id, stage, start_time, end_time")
+        st.sidebar.markdown("**Optional columns:**")
+        st.sidebar.code("worker_id, item_count, priority")
+
+        uploaded_file = st.sidebar.file_uploader(
+            "Upload warehouse event log",
+            type=["csv"],
+            help="CSV with columns: order_id, stage, start_time, end_time"
         )
-        severity = st.slider("Bottleneck severity", 1.0, 2.0, 1.4, 0.1)
-        seed = st.number_input("Random seed", value=42, step=1)
 
-        if st.button("Generate Data", type="primary"):
-            st.session_state["data_generated"] = True
+        if uploaded_file is not None:
+            try:
+                uploaded_df = pd.read_csv(uploaded_file)
+                is_valid, message = validate_uploaded_csv(uploaded_df)
 
-    # Generate data
-    df = load_data(num_days, bottleneck_stage, severity, seed)
+                if is_valid:
+                    df = process_uploaded_csv(uploaded_df)
+                    st.session_state.uploaded_df = df
+                    st.sidebar.success(f"Loaded {len(df):,} events from {df['order_id'].nunique():,} orders")
+
+                    # Calculate num_days from data
+                    df["start_time"] = pd.to_datetime(df["start_time"])
+                    num_days = (df["start_time"].max() - df["start_time"].min()).days + 1
+                else:
+                    st.sidebar.error(message)
+                    df = None
+            except Exception as e:
+                st.sidebar.error(f"Error reading CSV: {str(e)}")
+                df = None
+        elif st.session_state.uploaded_df is not None:
+            df = st.session_state.uploaded_df
+            num_days = (df["start_time"].max() - df["start_time"].min()).days + 1
+        else:
+            st.sidebar.info("Please upload a CSV file")
+            # Show sample data format
+            st.sidebar.markdown("**Sample format:**")
+            sample_df = pd.DataFrame({
+                "order_id": ["ORD-001", "ORD-001", "ORD-002"],
+                "stage": ["picking", "packing", "picking"],
+                "start_time": ["2024-01-01 09:00", "2024-01-01 09:15", "2024-01-01 09:05"],
+                "end_time": ["2024-01-01 09:12", "2024-01-01 09:22", "2024-01-01 09:18"]
+            })
+            st.sidebar.dataframe(sample_df, hide_index=True)
+
+    # If no data, show message and return
+    if df is None:
+        st.warning("Please select a data source and load data to continue.")
+        return
 
     # Sidebar - Worker Configuration
+    st.sidebar.markdown("---")
     st.sidebar.header("👷 Worker Configuration")
     workers = {}
     for stage in ["receiving", "picking", "packing", "sorting", "shipping"]:
         workers[stage] = st.sidebar.number_input(
             f"{stage.capitalize()} workers",
             min_value=1,
-            max_value=20,
+            max_value=50,
             value=DEFAULT_WORKERS[stage]
         )
 
-    # Main content
-    tab1, tab2, tab3, tab4 = st.tabs([
+    # Sidebar - Cost Configuration
+    st.sidebar.markdown("---")
+    st.sidebar.header("💵 Cost Settings")
+    hourly_wage = st.sidebar.number_input("Hourly wage ($)", min_value=10.0, max_value=100.0, value=18.0, step=0.5)
+    delay_cost_per_min = st.sidebar.number_input("Cost per delay minute ($)", min_value=0.1, max_value=10.0, value=0.50, step=0.1)
+    revenue_per_order = st.sidebar.number_input("Revenue per order ($)", min_value=1.0, max_value=500.0, value=25.0, step=1.0)
+
+    # Main content - 5 tabs now
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "📈 Current Status",
         "🔮 Predictions",
         "🧪 What-If Analysis",
-        "📋 Recommendations"
+        "📋 Recommendations",
+        "💰 Cost Analysis & Export"
     ])
+
+    # Pre-calculate common data
+    analysis = detect_bottleneck(df, workers)
+    base_cost_analysis = calculate_bottleneck_cost(df, delay_cost_per_min)
+    metrics = calculate_stage_metrics(df)
+    utilization = calculate_utilization(df, workers)
+    flow = calculate_flow_efficiency(df)
 
     # Tab 1: Current Status
     with tab1:
         st.header("Current Operational Status")
-
-        # Detect bottleneck
-        analysis = detect_bottleneck(df, workers)
-        cost_analysis = calculate_bottleneck_cost(df)
 
         # Key metrics row
         col1, col2, col3, col4 = st.columns(4)
@@ -138,11 +381,11 @@ def main():
             st.metric("Total Orders", f"{total_orders:,}")
 
         with col2:
-            throughput = total_orders / (num_days * 16)  # 16 operating hours
+            operating_hours = num_days * 16
+            throughput = total_orders / operating_hours if operating_hours > 0 else 0
             st.metric("Throughput", f"{throughput:.1f} orders/hr")
 
         with col3:
-            flow = calculate_flow_efficiency(df)
             avg_lead = flow["lead_time_minutes"].mean()
             st.metric("Avg Lead Time", f"{avg_lead:.0f} min")
 
@@ -174,15 +417,15 @@ def main():
             st.subheader("💰 Cost Impact")
             st.metric(
                 "Total Queue Time",
-                f"{cost_analysis['total_queue_minutes']:,.0f} min"
+                f"{base_cost_analysis['total_queue_minutes']:,.0f} min"
             )
             st.metric(
                 "Est. Delay Cost",
-                f"${cost_analysis['estimated_delay_cost']:,.0f}"
+                f"${base_cost_analysis['estimated_delay_cost']:,.0f}"
             )
             st.metric(
                 "Potential Extra Orders",
-                f"{cost_analysis['potential_additional_orders']:,}"
+                f"{base_cost_analysis['potential_additional_orders']:,}"
             )
 
         st.markdown("---")
@@ -190,13 +433,9 @@ def main():
         # Stage Metrics Visualization
         st.subheader("Stage Performance Metrics")
 
-        metrics = calculate_stage_metrics(df)
-        utilization = calculate_utilization(df, workers)
-
         col1, col2 = st.columns(2)
 
         with col1:
-            # Cycle Time Chart
             fig = px.bar(
                 metrics,
                 x="stage",
@@ -211,7 +450,6 @@ def main():
             st.plotly_chart(fig, use_container_width=True)
 
         with col2:
-            # Utilization Gauge
             fig = go.Figure()
 
             for i, row in utilization.iterrows():
@@ -261,7 +499,6 @@ def main():
 
         st.info("The ML model predicts which stage will become the bottleneck in the next hour based on current operational patterns.")
 
-        # Train model
         with st.spinner("Training prediction model..."):
             predictor, train_metrics = train_predictor(df)
 
@@ -275,7 +512,6 @@ def main():
 
         st.markdown("---")
 
-        # Make prediction
         st.subheader("Current Prediction")
 
         prediction = predictor.predict(df)
@@ -314,7 +550,6 @@ def main():
             else:
                 st.success("No significant risk factors detected")
 
-            # Feature importance
             st.markdown("**Top Predictive Features:**")
             importance = sorted(
                 train_metrics["feature_importance"].items(),
@@ -370,7 +605,7 @@ def main():
                     )
                 with col3:
                     if result.bottleneck_resolved:
-                        st.success("✅ Bottleneck Resolved!")
+                        st.success("Bottleneck Resolved!")
                     else:
                         st.warning(f"Bottleneck remains at {result.projected_bottleneck}")
 
@@ -399,7 +634,7 @@ def main():
                     )
                 with col3:
                     if result.bottleneck_resolved:
-                        st.success("✅ Bottleneck Resolved!")
+                        st.success("Bottleneck Resolved!")
                     else:
                         st.warning(f"Bottleneck remains at {result.projected_bottleneck}")
 
@@ -431,7 +666,7 @@ def main():
                         )
                     with col3:
                         if result.bottleneck_resolved:
-                            st.success("✅ Bottleneck Resolved!")
+                            st.success("Bottleneck Resolved!")
                         else:
                             st.warning(f"Bottleneck at {result.projected_bottleneck}")
 
@@ -478,7 +713,6 @@ def main():
         st.markdown("---")
         st.subheader("Quick Actions Summary")
 
-        # Create comparison table
         summary_data = []
         for rec in recommendations:
             summary_data.append({
@@ -494,6 +728,147 @@ def main():
             use_container_width=True,
             hide_index=True
         )
+
+    # Tab 5: Cost Analysis & Export (NEW)
+    with tab5:
+        st.header("Cost Analysis & Report Export")
+
+        # Calculate comprehensive costs
+        total_queue_minutes = flow["total_queue_time"].sum()
+        total_delay_cost = total_queue_minutes * delay_cost_per_min
+        potential_extra_orders = base_cost_analysis["potential_additional_orders"]
+        lost_revenue = potential_extra_orders * revenue_per_order
+
+        # Annualize (project based on data period)
+        days_in_data = num_days
+        annual_multiplier = 365 / days_in_data if days_in_data > 0 else 1
+        annual_loss = (total_delay_cost + lost_revenue) * annual_multiplier
+
+        cost_config = {
+            "hourly_wage": hourly_wage,
+            "delay_cost_per_min": delay_cost_per_min,
+            "revenue_per_order": revenue_per_order,
+            "total_queue_minutes": total_queue_minutes,
+            "total_delay_cost": total_delay_cost,
+            "potential_additional_orders": potential_extra_orders,
+            "lost_revenue": lost_revenue,
+            "annual_loss": annual_loss
+        }
+
+        st.subheader("💵 Financial Impact Analysis")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown("""
+            <div class="cost-savings">
+                <h3>Current Cost of Bottlenecks</h3>
+            </div>
+            """, unsafe_allow_html=True)
+
+            st.metric("Total Queue/Wait Time", f"{total_queue_minutes:,.0f} minutes")
+            st.metric("Delay Costs", f"${total_delay_cost:,.2f}")
+            st.metric("Lost Orders", f"{potential_extra_orders:,} orders")
+            st.metric("Lost Revenue", f"${lost_revenue:,.2f}")
+
+            st.markdown("---")
+            st.metric(
+                "Projected Annual Loss",
+                f"${annual_loss:,.0f}",
+                delta=f"Based on {days_in_data} days of data",
+                delta_color="inverse"
+            )
+
+        with col2:
+            st.markdown("**Cost Breakdown**")
+
+            cost_breakdown = pd.DataFrame({
+                "Category": ["Delay Costs", "Lost Revenue"],
+                "Amount": [total_delay_cost, lost_revenue]
+            })
+
+            fig = px.pie(
+                cost_breakdown,
+                values="Amount",
+                names="Category",
+                title="Bottleneck Cost Distribution",
+                color_discrete_sequence=["#ff6b6b", "#ffa502"]
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            # ROI Calculator
+            st.markdown("---")
+            st.markdown("**ROI Calculator**")
+
+            if recommendations:
+                top_rec = recommendations[0]
+                improvement_pct = top_rec.expected_improvement_pct / 100
+
+                potential_savings = annual_loss * improvement_pct
+                implementation_cost = st.number_input(
+                    "Estimated implementation cost ($)",
+                    min_value=0,
+                    max_value=1000000,
+                    value=5000,
+                    step=1000
+                )
+
+                if implementation_cost > 0:
+                    roi = ((potential_savings - implementation_cost) / implementation_cost) * 100
+                    payback_months = (implementation_cost / (potential_savings / 12)) if potential_savings > 0 else float('inf')
+
+                    st.metric("Potential Annual Savings", f"${potential_savings:,.0f}")
+                    st.metric("ROI", f"{roi:,.0f}%")
+                    st.metric("Payback Period", f"{payback_months:.1f} months" if payback_months < 100 else "N/A")
+
+        st.markdown("---")
+        st.subheader("📥 Export Reports")
+
+        col1, col2, col3 = st.columns(3)
+
+        # Generate recommendations for export
+        analyzer = WhatIfAnalyzer(df, workers)
+        export_recommendations = analyzer.generate_recommendations(5)
+
+        with col1:
+            # Excel Export
+            excel_data = generate_excel_report(
+                df, analysis, metrics, utilization,
+                export_recommendations, cost_config
+            )
+
+            st.download_button(
+                label="📊 Download Excel Report",
+                data=excel_data,
+                file_name=f"warehouse_analysis_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+            st.caption("Full analysis with multiple sheets")
+
+        with col2:
+            # CSV Summary Export
+            csv_data = generate_csv_report(
+                df, analysis, metrics,
+                export_recommendations, cost_config
+            )
+
+            st.download_button(
+                label="📄 Download Summary (TXT)",
+                data=csv_data,
+                file_name=f"warehouse_summary_{datetime.now().strftime('%Y%m%d')}.txt",
+                mime="text/plain"
+            )
+            st.caption("Quick text summary")
+
+        with col3:
+            # Raw Data Export
+            st.download_button(
+                label="📁 Download Raw Data (CSV)",
+                data=df.to_csv(index=False),
+                file_name=f"warehouse_events_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv"
+            )
+            st.caption("Event log data")
 
 
 if __name__ == "__main__":
