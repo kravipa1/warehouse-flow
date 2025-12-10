@@ -237,7 +237,7 @@ class WhatIfAnalyzer:
         """
         # Check feasibility
         from_workers = self.stage_workers.get(from_stage, 5)
-        if worker_count >= from_workers:
+        if from_stage == to_stage or worker_count >= from_workers:
             return ScenarioResult(
                 scenario_name=f"Move {worker_count} workers from {from_stage} to {to_stage}",
                 baseline_throughput=self._calculate_throughput(self.event_log),
